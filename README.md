@@ -27,6 +27,9 @@ tests/test_reversible.py                 reversible grads == autograd grads (fp6
 
 ## 1. Setup
 
+Data: notebook 00 streamed FineWeb-Edu and wrote 51,000,000 train and 1,000,000 val tokens (max token id 31 985 < 32 000). A 20M model after 50M tokens is still a very rough language model. The baseline's sample for "The water cycle is": *"The water cycle is 100 percent easier because the water temperatures are 10 percent lower. The water system for water is water quality, …"* It produces fluent-looking English without coherent content, which is expected at a loss of about 4.1.
+
+
 | | |
 |---|---|
 | Model | decoder-only transformer, pre-RMSNorm, RoPE, SwiGLU MLP, tied embeddings |
@@ -87,18 +90,23 @@ Pre-run numbers, measured on CPU (PyTorch 2.5.1, 1 thread, bf16 autocast, random
 | fp64 reversible vs autograd, max \|Δgrad\| (notebook-02 config) | 1.4e-17 | 1.0e-17 | 1.4e-17 | 5.6e-17 |
 | bf16, 8-layer reconstruction rel. error | 1.7e-3 | **9.4e-3** | 2.1e-3 | 2.7e-2 |
 | bf16, gradient rel. error vs autograd | 0.4% | 0.3% | 0.3% | 2.1% |
+| **T4 (notebook 02):** fp64 max \|Δgrad\| | 6.9e-18 | 1.4e-17 | 1.4e-17 | 7.6e-17 |
+| **T4:** bf16, 8-layer reconstruction rel. error | 1.2e-3 | **1.5e-2** | 2.1e-3 | 2.9e-2 |
+| **T4:** bf16, gradient rel. error vs autograd | 0.37% | 0.36% | 0.34% | 2.98% |
 
 An earlier local Apple-MPS run reported gradient errors of 1.1 / 4.7 / 1.0 / 6.3%. They did not reproduce here, so they are withdrawn. In particular, midpoint(a) does **not** cost gradient accuracy at init: its penalty shows up only in reconstruction.
 
-Activations saved for backward, B = 4, T = 512 (autograd saved-tensor hooks, each storage counted once, bf16 autocast, CPU). Notebook 02 has the same measurement on the GPU, including L = 32:
+Activations saved for backward, B = 4, T = 512 (autograd saved-tensor hooks, each storage counted once, bf16 autocast):
 
-| layers | Euler | any reversible variant |
-|---|---|---|
-| 8 | 345 MB | 49–52 MB (6.6–7.0× less) |
-| 16 | 643 MB | 49–52 MB (12.4–13.1×) |
-| 32 | (notebook 02) | (notebook 02) |
+| layers | Euler, CPU | Euler, **T4** | any reversible variant, **T4** | reduction on T4 |
+|---|---|---|---|---|
+| 8 | 345 MB | 462 MB | 47–49 MB | 9.4–9.8× |
+| 16 | 643 MB | 880 MB | 47–49 MB | 18–19× |
+| 32 | – | 1716 MB | 47–49 MB | 35–37× |
 
-Three things stand out. First, **depth drops out** of the reversible column. Second, midpoint(a)'s division by a costs 4.5× more reconstruction error than plain midpoint (9.4e-3 vs 2.1e-3), far below the 256× worst case. Third, that reconstruction penalty does not carry into the gradient at init. The T4 runs use fp16, which has 3 more mantissa bits than bf16, so drift there should be about 8× smaller.
+On the T4 Euler grows by about 52 MB per layer at B = 4. The reversible column does not move at all between 8 and 32 layers.
+
+Three things stand out. First, **depth drops out** of the reversible column. Second, midpoint(a)'s division by a costs more reconstruction error than plain midpoint: 4.5× on CPU (9.4e-3 vs 2.1e-3) and 7× on the T4 (1.5e-2 vs 2.1e-3), far below the 256× worst case. Third, that reconstruction penalty does not carry into the gradient at init (0.36% vs 0.34% on the T4). Leapfrog is the outlier on both counts, with about 3% gradient error.
 
 **A bug these checks caught.** Autocast caches each weight's low-precision cast for the whole autocast region. `RevStackFn.forward` runs with grad disabled, so its cached casts carry no graph. When `backward()` was called *inside* the autocast region, the backward re-evaluation reused those casts, and 16 of 26 parameters (every block weight matrix) silently received no gradient. `train_step` calls backward outside autocast, so training was unaffected; notebook 02's drift cell calls it inside, and would have crashed. The fix is `cache_enabled=False` for the autocast context in the reversible backward (`revllm/model.py: _amp_state`), guarded by `tests/test_reversible.py::test_autocast_grads_present_and_close`. That test fails on the unfixed code (4 of 8 cases) and passes after the fix.
 
@@ -106,47 +114,87 @@ Three things stand out. First, **depth drops out** of the reversible column. Sec
 
 ## 3. Results
 
-> Filled in from `results/RESULTS.md`, which `notebooks/04_results.ipynb` generates.
-> GPU: **<fill in: e.g. Tesla T4 16 GB, fp16>**
+All numbers come from the executed notebooks on Colab (**Tesla T4, 15 360 MiB**). `results/RESULTS.md` is the table that notebook 04 generated.
+
+> **Precision caveat.** These runs used **bf16 autocast on a T4**. The T4 (sm_75) has no bf16 tensor cores, and PyTorch reports bf16 as supported only through emulation. Every run used the same setting, so the ratios between runs are like-for-like. The absolute tokens/s, however, are far below what the T4 can do in fp16. `amp_dtype` has since been changed to use fp16 on pre-Ampere GPUs (bf16 only from compute capability 8.0).
+
+### Main table: 20.16M params, 50M tokens each
+
+| run | residual | batch (seq × 512) | optimizer steps | final train loss | final val loss | tokens/s | peak mem alloc (GB) | peak mem reserved (GB) | wall time (min) |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 · baseline | euler | 64 (fixed) | 1 525 | 4.0896 | 4.1205 | 11 782 | 8.10 | 8.58 | 72.1 |
+| 2 · reversible | leapfrog_h1 | 64 (fixed) | 1 525 | **4.0769** | **4.1055** | 8 275 | 7.14 ‡ (train step: **2.26**) | 8.23 ‡ | 102.2 |
+| 3 · reversible, max batch | leapfrog_h1 | **408** | 239 | 5.4475 | 5.4190 | 9 420 | 12.64 | 14.42 | 92.5 |
+
+Relative to the baseline:
+
+| | throughput | peak memory | val loss |
+|---|---|---|---|
+| run 2 (same batch) | **0.70×** | **0.28×** (2.26 vs 8.11 GB, train step) | −0.015 |
+| run 3 (max batch) | **0.80×** | 1.56× (it fills the GPU on purpose) | +1.30 |
+
+‡ **Run 2's logged peak includes evaluation.** Under `torch.no_grad()` the loss fell back to full-vocabulary fp32 logits, and at this batch that eval pass, not training, set the 7.14 GB peak. The train-step peak of the same model at the same batch, measured separately by `fits()`, is **2.26 GB** (next table). The baseline (8.10 GB) and run 3 (12.64 GB) are dominated by training, so eval does not affect them. This has since been fixed: evaluation now uses the chunked loss, and `train()` resets evaluation out of the reported peak.
+
+### Validation loss during training (runs 1 and 2, same batch and data)
+
+| step (tokens) | 250 (8.2M) | 500 (16.4M) | 750 (24.6M) | 1000 (32.8M) | 1250 (41.0M) | 1500 (49.2M) | 1525 (50.0M) |
+|---|---|---|---|---|---|---|---|
+| baseline (euler) | 5.3481 | 4.7544 | 4.4779 | 4.3018 | 4.1828 | 4.1236 | 4.1205 |
+| reversible (leapfrog_h1) | **5.1826** | **4.6751** | **4.4371** | **4.2739** | **4.1640** | **4.1080** | **4.1055** |
+| gap | −0.166 | −0.079 | −0.041 | −0.028 | −0.019 | −0.016 | −0.015 |
+
+The reversible run leads at every evaluation, and the gap shrinks steadily as training proceeds. Leapfrog learns faster early on, and both runs converge to nearly the same loss.
 
 ### Batch sizes
 
 | | batch (sequences × 512) | tokens / step | optimizer steps for 50M tokens |
 |---|---|---|---|
-| baseline max | <fill> | | |
-| **fixed** (runs 1 & 2) | <fill> | | |
-| reversible max (run 3) | <fill> | | |
-| reversible trained (run 3; = max unless the OOM fallback fired) | <fill> | | |
+| baseline max | 120 | 61 440 | – |
+| **fixed** (runs 1 & 2) | **64** | 32 768 | 1 525 |
+| reversible max (run 3 search) | **456** (3.8× the baseline max, 7.1× the fixed batch) | 233 472 | 214 |
+| reversible trained (run 3) | **408** | 208 896 | 239 |
 
-Prediction made before running, extrapolated from the saved-bytes numbers (about 86 MB per sequence for the baseline vs about 12.5 MB reversible, from the CPU table in §2); these are estimates, not measurements. On a 16 GB T4, baseline max ≈ 150 → fixed 128 → ≈ 760 steps. Reversible max ≈ 800–1000+ → only ≈ 100 steps for the same 50M tokens.
+Baseline search trace: 16 → 3.35 GB, 32 → 4.93, 64 → 8.10, 96 → 11.27, 112 → 12.85, 120 → 13.65; 128 ran out of memory. The fixed batch is the largest power of two at or below 120, i.e. 64.
 
-### Main table
+The reversible search found 456 by running two full train steps at that size, but the real run went out of memory at 456, probably from allocator fragmentation over many steps or from the eval pass, which used full-vocabulary logits at the time. The notebook's fallback retried at 90% of that, 408, and finished. Search trace: 128 → 4.18 GB, 256 → 8.05, 384 → 11.92, 448 → 13.85, 456 → 14.10; 464, 480 and 512 ran out of memory.
 
-| run | residual | batch | optimizer steps | final train loss | final val loss | tokens/s | peak mem alloc (GB) | peak mem reserved (GB) | wall time (min) |
-|---|---|---|---|---|---|---|---|---|---|
-| baseline | euler | | | | | | | | |
-| reversible | <variant> | | | | | | | | |
-| reversible_maxbatch | <variant> | | | | | | | | |
+My pre-run prediction was a baseline max of ≈ 150 and a reversible max of 800–1000+. Both were too high, because the T4 needs more activation memory per sequence than the CPU measurements suggested. Run 3 still got only 239 optimizer steps, the step starvation the prediction was about.
 
-### Which reversible variant worked (5M-token sweep at the fixed batch)
+### Train-step peak memory at the fixed batch (B = 64, `fits()`)
 
-| variant | val loss @ 5M | tokens/s | peak mem (GB) | recon rel. err | grad rel. err |
+| model | plain autograd | reversible backprop | reduction |
+|---|---|---|---|
+| euler (baseline) | **8.11 GB** | – | – |
+| hamiltonian | 8.11 GB | **2.20 GB** | 3.7× |
+| midpoint(a=0.5, h=0.25) | 8.11 GB | **2.18 GB** | 3.7× |
+| plain midpoint (h=0.25) | 8.11 GB | **2.14 GB** | 3.8× |
+| leapfrog (h=1) | 8.11 GB | **2.26 GB** | 3.6× |
+
+Each number is the peak over two full optimizer steps, including weights, gradients and AdamW state. With plain autograd every variant costs exactly what Euler costs, so the saving comes entirely from reversible backprop, not from the rewiring.
+
+### Memory vs depth (batch 16, `fits()`)
+
+| layers | Euler peak (GB) | leapfrog_h1 peak (GB) | ratio |
+|---|---|---|---|
+| 4 | 2.50 | 1.73 | 1.4× |
+| 8 | 3.35 | 1.78 | 1.9× |
+| 16 | 5.03 | 1.89 | 2.7× |
+| 32 | 8.40 | 2.11 | **4.0×** |
+
+Euler adds about **0.21 GB per layer**; the reversible model adds about **0.014 GB per layer**, which is just the extra weights, gradients and AdamW state (≈ 1.24M params × 16 bytes ≈ 20 MB). What remains (≈ 1.7 GB) is independent of depth: embeddings, the loss chunk, one layer's live graph, and the CUDA context.
+
+### Which reversible variant worked (5M-token sweep at B = 64)
+
+| variant | val loss @ 5M | final train loss | tokens/s | recon rel. err (init, bf16) | grad rel. err (init, bf16) |
 |---|---|---|---|---|---|
-| hamiltonian (a=b=1) | | | | | |
-| midpoint(a=0.5, h=0.25) | | | | | |
-| plain midpoint (h=0.25) | | | | | |
-| leapfrog (h=1) | | | | | |
+| hamiltonian (a=b=1) | 6.3162 | 6.2928 | 8 418 | 1.2e-3 | 0.37% |
+| midpoint(a=0.5, h=0.25) | 6.3351 | 6.3147 | 8 285 | 1.5e-2 | 0.36% |
+| plain midpoint (h=0.25) | 6.1561 | 6.1341 | 8 316 | 2.1e-3 | 0.34% |
+| **leapfrog (h=1)** | **6.0400** | **6.0164** | 8 306 | 2.9e-2 | 2.98% |
 
-**Variant used for runs 2 and 3: `<fill>`**, because <fill: lowest val loss / stable / drift acceptable>.
+B = 64, 152 optimizer steps (5M tokens) each, one seed, 13.4–13.5 min per variant. The sweep runs' logged peaks (7.05–7.14 GB) include evaluation, like run 2's (‡ above).
 
-### Memory vs depth (batch 16)
-
-| layers | Euler peak (GB) | <variant> peak (GB) |
-|---|---|---|
-| 4 | | |
-| 8 | | |
-| 16 | | |
-| 32 | | |
+**Variant used for runs 2 and 3: `leapfrog_h1`.** It had the lowest validation loss after 5M tokens and led at every evaluation from step 20 onward. It finished 0.12 below plain midpoint and 0.28–0.30 below the Hamiltonian and midpoint(a) variants. It is also the variant with the largest precision drift. The lesson's recipe, midpoint(a=0.5, h=0.25), came last by a small margin. With one seed and 152 steps, that ranking says more about early learning speed than about final quality.
 
 ### Plots
 
@@ -158,18 +206,19 @@ Prediction made before running, extrapolated from the saved-bytes numbers (about
 
 ## 4. Findings
 
-<!-- Replace the bracketed parts with your numbers; keep the ones your data supports. -->
-
-1. **Memory.** At the fixed batch, reversible backprop cut peak memory from <X> GB to <Y> GB. What remains is weights, AdamW state, the embedding output, the final two-tensor state, one layer's live graph during backward, and the CE chunk. The depth sweep shows Euler growing about linearly in L while the reversible model stays flat (<numbers>), which is the lesson's central claim. At only 8 layers the saving (about 6× in activations) understates what happens in deep models, where the paper reports about 10×.
-2. **Throughput.** At the same batch the reversible model runs at <r>× the baseline's tokens/s. That matches the one-extra-block-evaluation cost (≈4/3 compute, 30–50% overhead).
-3. **Max batch.** The reversible model fits <B_max> sequences against the baseline's <B_base> (<k>× larger), and tokens/s <rises/falls> to <…>. This batch increase is where reversibility's throughput gains come from.
-4. **Loss at a fixed token budget.** Run 2 lands within <Δ> of the baseline: same parameter count, and reversible gradients equal autograd's up to rounding. Run 3 ends clearly **worse** (<Δ>). It sees the same 50M tokens, but in only <N> optimizer steps against <M>. The loss-vs-steps panel shows it on the same per-step curve, just stopped early. Past the critical batch size, extra batch buys memory headroom and hardware utilisation, not loss per token. At a fixed budget of steps, or of wall-clock time on a bigger model, the picture reverses.
-5. **Variants.** <e.g. midpoint(a=0.5, h=0.25) trained best / most stable; plain midpoint <diverged | was worse>, consistent with its undamped parasitic mode; Hamiltonian <…>; leapfrog has the largest drift because its state grows quickly (velocity accumulates every increment).> The reconstruction error of the trained <variant> in <dtype> was <value>.
-6. **Practical notes.**
+1. **Reversibility cuts memory 3.6× at the same batch, and more with depth.** At B = 64 the train-step peak fell from **8.11 GB to 2.26 GB**. Activations saved for backward stay at 47–49 MB whether the model has 8 or 32 layers, while Euler's grow linearly (462 → 880 → 1716 MB at B = 4). End to end, the memory ratio grows with depth: 1.4× at 4 layers, 1.9× at 8, 2.7× at 16, **4.0× at 32** (batch 16). Past about 4 layers, depth effectively drops out of the memory cost. That is the lesson's central claim, reproduced on a T4.
+2. **It costs 30% throughput at the same batch.** Run 2 ran at **0.70×** the baseline's tokens/s (8 275 vs 11 782). The lesson's cost model predicts 0.75×: one extra block evaluation per layer, 4 forward-equivalents instead of 3. The remaining gap is likely kernel-launch and bookkeeping overhead from re-running each layer separately in backward, which the idealised count ignores.
+3. **Same batch, same quality.** Run 2 finished at val loss **4.1055** against the baseline's 4.1205. It was ahead at every evaluation (table below), and it has the same parameter count and data. Reversible backprop did not cost accuracy. The small lead is the leapfrog architecture, not the backprop, and it is a single seed.
+4. **Max batch: 7.1× the fixed batch fits, and throughput recovers somewhat.** The reversible model fits **456** sequences (trained at 408) against the baseline's 120. The bigger batch lifted throughput from 8 275 to **9 420 tok/s** (+14%). That is still 0.80× the baseline: a bigger batch amortises per-step overhead but cannot remove the extra block evaluation.
+5. **At a fixed 50M-token budget, the max batch loses badly: val loss 5.42 vs 4.11.** Run 3 saw the same tokens in only **239** optimizer steps against 1 525. The loss-vs-steps panel shows why: run 3 lands right on the fixed-batch runs' per-step curve (5.42 at step 239 vs 5.18–5.35 at step 250), so each step's 6.4× more tokens bought almost nothing. This suggests B = 64 is already above the critical batch size for this model at this stage of training: the number of updates limits progress, not gradient noise. The two runs' learning-rate schedules differ (run 3 is fully decayed by step 239), so that comparison is indicative, not exact. The larger batch pays off only under a fixed budget of steps or wall-clock time on a model big enough to use it, not under a fixed token budget.
+6. **Variants.** All four trained stably and none diverged. Leapfrog (h = 1) learned fastest despite having the largest bf16 drift (2.9e-2 reconstruction and 3% gradient error at init). After training its reconstruction error grew to **21%** in bf16 (0.214, relative, after inverting 8 layers). Even so, run 2 matched the baseline's loss, so at 8 layers the drift did not hurt training. On a deeper model, or at a higher learning rate, it would be the first thing to check. midpoint(a) pays about 7× plain midpoint's reconstruction error for its division by a, but not in gradient error.
+7. **Practical notes.**
    - The dropout rate must be 0 (or the RNG must be replayed), or the re-evaluation will not match the forward.
    - `torch.compile` does not trace the custom backward.
-   - A custom recompute path must not reuse autocast's cast cache: the forward's no-grad casts will be reused by the backward re-evaluation if backward runs inside the same autocast region, dropping every block weight gradient without an error (see §2).
-   - Chunked cross-entropy matters as much as reversibility: a full fp32 logits tensor at B = 64 is about 4 GB on its own.
+   - A custom recompute path must not reuse autocast's cast cache. If backward runs inside the same autocast region, the forward's no-grad casts are reused in the backward re-evaluation, and every block weight's gradient is silently dropped (see §2).
+   - Chunk the cross-entropy in evaluation too. Otherwise the eval pass, not training, sets the peak-memory figure: 7.1 GB was reported here against a true train-step peak of 2.3 GB.
+   - Check the autocast dtype on older GPUs. `torch.cuda.is_bf16_supported()` returns True on a T4 through emulation.
+   - A max batch found by a 2-step probe is not safe for a long run: the run went out of memory at the probed 456 and needed the fallback to 408.
 
 ---
 

@@ -41,7 +41,9 @@ def get_device():
 
 def amp_dtype(device):
     if device.type == "cuda":
-        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        # bf16 only where it is native (Ampere+). On a T4 (sm_75) is_bf16_supported() is True via
+        # emulation, which runs without tensor cores and is several times slower than fp16.
+        return torch.bfloat16 if torch.cuda.get_device_capability() >= (8, 0) else torch.float16
     if device.type == "mps":
         return torch.bfloat16
     return None
@@ -130,6 +132,7 @@ def train(cfg: TrainConfig):
 
     history, evals = [], []
     reset_peak(device)
+    peak_train = (0.0, 0.0)  # peak memory of train steps only; evaluation is reset out of it
     t_start = time.time()
     t_train = 0.0            # time spent in train steps only (evals excluded)
     timed_tokens = 0
@@ -160,14 +163,17 @@ def train(cfg: TrainConfig):
 
         if (step + 1) % cfg.eval_every == 0 or step == steps - 1:
             sync(device)
+            peak_train = tuple(map(max, peak_train, peak_mem_gb(device)))
             t0 = time.time()
             vl = evaluate(model, val_data, cfg, dtype, device)
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats()
             evals.append(dict(step=step + 1, tokens=(step + 1) * tok_per_step, val_loss=vl))
             print(f"  eval @ {step+1}: val_loss {vl:.4f}")
             t_mark += time.time() - t0              # do not charge eval time to throughput
 
     wall = time.time() - t_start
-    alloc, reserved = peak_mem_gb(device)
+    alloc, reserved = tuple(map(max, peak_train, peak_mem_gb(device)))
     last = history[-max(1, len(history) // 20):]    # mean of the last 5% of logged train losses
     result = dict(
         name=cfg.name, device=str(device),

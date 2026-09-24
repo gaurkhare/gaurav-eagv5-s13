@@ -275,11 +275,14 @@ class LLM(nn.Module):
         """Cross-entropy that never materialises the full (B*T, vocab) fp32 logits tensor."""
         h, targets = h.flatten(0, 1), targets.flatten()
         chunk = self.cfg.ce_chunk
-        if not chunk or not torch.is_grad_enabled():
+        if not chunk:
             return F.cross_entropy(self.lm_head(h).float(), targets)
         total = h.new_zeros((), dtype=torch.float32)
         for hs, ts in zip(h.split(chunk), targets.split(chunk)):
-            total = total + checkpoint(_ce_sum, hs, ts, self.lm_head.weight, use_reentrant=False)
+            if torch.is_grad_enabled():
+                total = total + checkpoint(_ce_sum, hs, ts, self.lm_head.weight, use_reentrant=False)
+            else:                                   # evaluation: chunk too, no checkpoint needed
+                total = total + _ce_sum(hs, ts, self.lm_head.weight)
         return total / targets.numel()
 
 
